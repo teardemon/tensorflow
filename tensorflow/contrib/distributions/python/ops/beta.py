@@ -18,388 +18,350 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-# pylint: disable=line-too-long
+import numpy as np
 
 from tensorflow.contrib.distributions.python.ops import distribution
+from tensorflow.contrib.distributions.python.ops import distribution_util
+from tensorflow.contrib.distributions.python.ops import kullback_leibler
+from tensorflow.contrib.framework.python.framework import tensor_util as contrib_tensor_util
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
-from tensorflow.python.framework import tensor_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import nn
 from tensorflow.python.ops import random_ops
 
-# pylint: enable=line-too-long
+
+__all__ = [
+    "Beta",
+    "BetaWithSoftplusConcentration",
+]
+
+
+_beta_sample_note = """Note: `x` must have dtype `self.dtype` and be in
+`[0, 1].` It must have a shape compatible with `self.batch_shape()`."""
 
 
 class Beta(distribution.Distribution):
   """Beta distribution.
 
-  This distribution is parameterized by `a` and `b` which are shape
-  parameters.
+  The Beta distribution is defined over the `(0, 1)` interval using parameters
+  `concentration1` (aka "alpha") and `concentration0` (aka "beta").
 
-  #### Mathematical details
+  #### Mathematical Details
 
-  The Beta is a distribution over the interval (0, 1).
-  The distribution has hyperparameters `a` and `b` and
-  probability mass function (pdf):
+  The probability density function (pdf) is,
 
-  ```pdf(x) = 1 / Beta(a, b) * x^(a - 1) * (1 - x)^(b - 1)```
+  ```none
+  pdf(x; alpha, beta) = x**(alpha - 1) (1 - x)**(beta - 1) / Z
+  Z = Gamma(alpha) Gamma(beta) / Gamma(alpha + beta)
+  ```
 
-  where `Beta(a, b) = Gamma(a) * Gamma(b) / Gamma(a + b)`
-  is the beta function.
+  where:
 
+  * `concentration1 = alpha`,
+  * `concentration0 = beta`,
+  * `Z` is the normalization constant, and,
+  * `Gamma` is the [gamma function](
+    https://en.wikipedia.org/wiki/Gamma_function).
 
-  This class provides methods to create indexed batches of Beta
-  distributions. One entry of the broacasted
-  shape represents of `a` and `b` represents one single Beta distribution.
-  When calling distribution functions (e.g. `dist.pdf(x)`), `a`, `b`
-  and `x` are broadcast to the same shape (if possible).
-  Every entry in a/b/x corresponds to a single Beta distribution.
+  The concentration parameters represent mean total counts of a `1` or a `0`,
+  i.e.,
+
+  ```none
+  concentration1 = alpha = mean * total_concentration
+  concentration0 = beta  = (1. - mean) * total_concentration
+  ```
+
+  where `mean` in `(0, 1)` and `total_concentration` is a positive real number
+  representing a mean `total_count = concentration1 + concentration0`.
+
+  Distribution parameters are automatically broadcast in all functions; see
+  examples for details.
 
   #### Examples
 
-  Creates 3 distributions.
-  The distribution functions can be evaluated on x.
-
   ```python
-  a = [1, 2, 3]
-  b = [1, 2, 3]
-  dist = Beta(a, b)
+  # Create a batch of three Beta distributions.
+  alpha = [1, 2, 3]
+  beta = [1, 2, 3]
+  dist = Beta(alpha, beta)
+
+  dist.sample([4, 5])  # Shape [4, 5, 3]
+
+  # `x` has three batch entries, each with two samples.
+  x = [[.1, .4, .5],
+       [.2, .3, .5]]
+  # Calculate the probability of each pair of samples under the corresponding
+  # distribution in `dist`.
+  dist.prob(x)         # Shape [2, 3]
   ```
 
   ```python
-  # x same shape as a.
-  x = [.2, .3, .7]
-  dist.pdf(x)  # Shape [3]
+  # Create batch_shape=[2, 3] via parameter broadcast:
+  alpha = [[1.], [2]]      # Shape [2, 1]
+  beta = [3., 4, 5]        # Shape [3]
+  dist = Beta(alpha, beta)
 
-  # a/b will be broadcast to [[1, 2, 3], [1, 2, 3]] to match x.
-  x = [[.1, .4, .5], [.2, .3, .5]]
-  dist.pdf(x)  # Shape [2, 3]
+  # alpha broadcast as: [[1., 1, 1,],
+  #                      [2, 2, 2]]
+  # beta broadcast as:  [[3., 4, 5],
+  #                      [3, 4, 5]]
+  # batch_Shape [2, 3]
+  dist.sample([4, 5])  # Shape [4, 5, 2, 3]
 
-  # a/b will be broadcast to shape [5, 7, 3] to match x.
-  x = [[...]]  # Shape [5, 7, 3]
-  dist.pdf(x)  # Shape [5, 7, 3]
-  ```
-
-  Creates a 2-batch of 3-class distributions.
-
-  ```python
-  a = [[1, 2, 3], [4, 5, 6]]  # Shape [2, 3]
-  b = 5  # Shape []
-  dist = Beta(a, b)
-
-  # x will be broadcast to [[.2, .3, .9], [.2, .3, .9]] to match a/b.
-  x = [.2, .3, .9]
-  dist.pdf(x)  # Shape [2]
+  x = [.2, .3, .5]
+  # x will be broadcast as [[.2, .3, .5],
+  #                         [.2, .3, .5]],
+  # thus matching batch_shape [2, 3].
+  dist.prob(x)         # Shape [2, 3]
   ```
 
   """
 
-  def __init__(self, a, b, validate_args=True, allow_nan_stats=False,
+  def __init__(self,
+               concentration1=None,
+               concentration0=None,
+               validate_args=False,
+               allow_nan_stats=True,
                name="Beta"):
     """Initialize a batch of Beta distributions.
 
     Args:
-      a:  Positive floating point tensor with shape broadcastable to
-        `[N1,..., Nm]` `m >= 0`.  Defines this as a batch of `N1 x ... x Nm`
-         different Beta distributions. This also defines the
-         dtype of the distribution.
-      b:  Positive floating point tensor with shape broadcastable to
-        `[N1,..., Nm]` `m >= 0`.  Defines this as a batch of `N1 x ... x Nm`
-         different Beta distributions.
-      validate_args: Whether to assert valid values for parameters `a` and `b`,
-        and `x` in `prob` and `log_prob`.  If `False`, correct behavior is not
-        guaranteed.
-      allow_nan_stats:  Boolean, default `False`.  If `False`, raise an
-        exception if a statistic (e.g. mean/mode/etc...) is undefined for any
-        batch member.  If `True`, batch members with valid parameters leading to
-        undefined statistics will return NaN for this statistic.
-      name: The name to prefix Ops created by this distribution class.
-
-    Examples:
-
-    ```python
-    # Define 1-batch.
-    dist = Beta(1.1, 2.0)
-
-    # Define a 2-batch.
-    dist = Beta([1.0, 2.0], [4.0, 5.0])
-    ```
-
+      concentration1: Positive floating-point `Tensor` indicating mean
+        number of successes; aka "alpha". Implies `self.dtype` and
+        `self.batch_shape`, i.e.,
+        `concentration1.shape = [N1, N2, ..., Nm] = self.batch_shape`.
+      concentration0: Positive floating-point `Tensor` indicating mean
+        number of failures; aka "beta". Otherwise has same semantics as
+        `concentration1`.
+      validate_args: Python `bool`, default `False`. When `True` distribution
+        parameters are checked for validity despite possibly degrading runtime
+        performance. When `False` invalid inputs may silently render incorrect
+        outputs.
+      allow_nan_stats: Python `bool`, default `True`. When `True`, statistics
+        (e.g., mean, mode, variance) use the value "`NaN`" to indicate the
+        result is undefined. When `False`, an exception is raised if one or
+        more of the statistic's batch members are undefined.
+      name: Python `str` name prefixed to Ops created by this class.
     """
-    with ops.name_scope(name, values=[a, b]):
-      with ops.control_dependencies([
-          check_ops.assert_positive(a),
-          check_ops.assert_positive(b)] if validate_args else []):
-        a = array_ops.identity(a, name="a")
-        b = array_ops.identity(b, name="b")
+    parameters = locals()
+    with ops.name_scope(name, values=[concentration1, concentration0]):
+      self._concentration1 = self._maybe_assert_valid_concentration(
+          ops.convert_to_tensor(concentration1, name="concentration1"),
+          validate_args)
+      self._concentration0 = self._maybe_assert_valid_concentration(
+          ops.convert_to_tensor(concentration0, name="concentration0"),
+          validate_args)
+      contrib_tensor_util.assert_same_float_dtype([
+          self._concentration1, self._concentration0])
+      self._total_concentration = self._concentration1 + self._concentration0
+    super(Beta, self).__init__(
+        dtype=self._total_concentration.dtype,
+        validate_args=validate_args,
+        allow_nan_stats=allow_nan_stats,
+        reparameterization_type=distribution.NOT_REPARAMETERIZED,
+        parameters=parameters,
+        graph_parents=[self._concentration1,
+                       self._concentration0,
+                       self._total_concentration],
+        name=name)
 
-      self._a = a
-      self._b = b
-      self._name = name
-
-      # Used for mean/mode/variance/entropy/sampling computations
-      self._a_b_sum = self._a + self._b
-
-      self._get_batch_shape = self._a_b_sum.get_shape()
-      self._get_event_shape = tensor_shape.TensorShape([])
-      self._validate_args = validate_args
-      self._allow_nan_stats = allow_nan_stats
+  @staticmethod
+  def _param_shapes(sample_shape):
+    return dict(zip(
+        ["concentration1", "concentration0"],
+        [ops.convert_to_tensor(sample_shape, dtype=dtypes.int32)] * 2))
 
   @property
-  def a(self):
-    """Shape parameter."""
-    return self._a
+  def concentration1(self):
+    """Concentration parameter associated with a `1` outcome."""
+    return self._concentration1
 
   @property
-  def b(self):
-    """Shape parameter."""
-    return self._b
+  def concentration0(self):
+    """Concentration parameter associated with a `0` outcome."""
+    return self._concentration0
 
   @property
-  def name(self):
-    """Name to prepend to all ops."""
-    return self._name
+  def total_concentration(self):
+    """Sum of concentration parameters."""
+    return self._total_concentration
 
-  @property
-  def dtype(self):
-    """dtype of samples from this distribution."""
-    return self._a_b_sum.dtype
+  def _batch_shape_tensor(self):
+    return array_ops.shape(self.total_concentration)
 
-  @property
-  def allow_nan_stats(self):
-    """Boolean describing behavior when a stat is undefined for batch member."""
-    return self._allow_nan_stats
+  def _batch_shape(self):
+    return self.total_concentration.get_shape()
 
-  @property
-  def validate_args(self):
-    """Boolean describing behavior on invalid input."""
-    return self._validate_args
+  def _event_shape_tensor(self):
+    return constant_op.constant([], dtype=dtypes.int32)
 
-  def batch_shape(self, name="batch_shape"):
-    """Batch dimensions of this instance as a 1-D int32 `Tensor`.
+  def _event_shape(self):
+    return tensor_shape.scalar()
 
-    The product of the dimensions of the `batch_shape` is the number of
-    independent distributions of this kind the instance represents.
+  def _sample_n(self, n, seed=None):
+    expanded_concentration1 = array_ops.ones_like(
+        self.total_concentration, dtype=self.dtype) * self.concentration1
+    expanded_concentration0 = array_ops.ones_like(
+        self.total_concentration, dtype=self.dtype) * self.concentration0
+    gamma1_sample = random_ops.random_gamma(
+        shape=[n],
+        alpha=expanded_concentration1,
+        dtype=self.dtype,
+        seed=seed)
+    gamma2_sample = random_ops.random_gamma(
+        shape=[n],
+        alpha=expanded_concentration0,
+        dtype=self.dtype,
+        seed=distribution_util.gen_new_seed(seed, "beta"))
+    beta_sample = gamma1_sample / (gamma1_sample + gamma2_sample)
+    return beta_sample
 
-    Args:
-      name: name to give to the op
+  @distribution_util.AppendDocstring(_beta_sample_note)
+  def _log_prob(self, x):
+    return self._log_unnormalized_prob(x) - self._log_normalization()
 
-    Returns:
-      `Tensor` `batch_shape`
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._a_b_sum]):
-        return array_ops.shape(self._a_b_sum)
+  @distribution_util.AppendDocstring(_beta_sample_note)
+  def _prob(self, x):
+    return math_ops.exp(self._log_prob(x))
 
-  def get_batch_shape(self):
-    """`TensorShape` available at graph construction time.
+  @distribution_util.AppendDocstring(_beta_sample_note)
+  def _log_cdf(self, x):
+    return math_ops.log(self._cdf(x))
 
-    Same meaning as `batch_shape`. May be only partially defined.
+  @distribution_util.AppendDocstring(_beta_sample_note)
+  def _cdf(self, x):
+    return math_ops.betainc(self.concentration1, self.concentration0, x)
 
-    Returns:
-      batch shape
-    """
-    return self._get_batch_shape
+  def _log_unnormalized_prob(self, x):
+    x = self._maybe_assert_valid_sample(x)
+    return ((self.concentration1 - 1.) * math_ops.log(x)
+            + (self.concentration0 - 1.) * math_ops.log1p(-x))
 
-  def event_shape(self, name="event_shape"):
-    """Shape of a sample from a single distribution as a 1-D int32 `Tensor`.
+  def _log_normalization(self):
+    return (math_ops.lgamma(self.concentration1)
+            + math_ops.lgamma(self.concentration0)
+            - math_ops.lgamma(self.total_concentration))
 
-    Args:
-      name: name to give to the op
+  def _entropy(self):
+    return (
+        self._log_normalization()
+        - (self.concentration1 - 1.) * math_ops.digamma(self.concentration1)
+        - (self.concentration0 - 1.) * math_ops.digamma(self.concentration0)
+        + ((self.total_concentration - 2.) *
+           math_ops.digamma(self.total_concentration)))
 
-    Returns:
-      `Tensor` `event_shape`
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name):
-        return constant_op.constant([], name=name, dtype=dtypes.int32)
+  def _mean(self):
+    return self._concentration1 / self._total_concentration
 
-  def get_event_shape(self):
-    """`TensorShape` available at graph construction time.
+  def _variance(self):
+    return self._mean() * (1. - self._mean()) / (1. + self.total_concentration)
 
-    Same meaning as `event_shape`. May be only partially defined.
+  @distribution_util.AppendDocstring(
+      """Note: The mode is undefined when `concentration1 <= 1` or
+      `concentration0 <= 1`. If `self.allow_nan_stats` is `True`, `NaN`
+      is used for undefined modes. If `self.allow_nan_stats` is `False` an
+      exception is raised when one or more modes are undefined.""")
+  def _mode(self):
+    mode = (self.concentration1 - 1.) / (self.total_concentration - 2.)
+    if self.allow_nan_stats:
+      nan = array_ops.fill(
+          self.batch_shape_tensor(),
+          np.array(np.nan, dtype=self.dtype.as_numpy_dtype()),
+          name="nan")
+      is_defined = math_ops.logical_and(self.concentration1 > 1.,
+                                        self.concentration0 > 1.)
+      return array_ops.where(is_defined, mode, nan)
+    return control_flow_ops.with_dependencies([
+        check_ops.assert_less(
+            array_ops.ones([], dtype=self.dtype),
+            self.concentration1,
+            message="Mode undefined for concentration1 <= 1."),
+        check_ops.assert_less(
+            array_ops.ones([], dtype=self.dtype),
+            self.concentration0,
+            message="Mode undefined for concentration0 <= 1.")
+    ], mode)
 
-    Returns:
-      event shape
-    """
-    return self._get_event_shape
+  def _maybe_assert_valid_concentration(self, concentration, validate_args):
+    """Checks the validity of a concentration parameter."""
+    if not validate_args:
+      return concentration
+    return control_flow_ops.with_dependencies([
+        check_ops.assert_positive(
+            concentration,
+            message="Concentration parameter must be positive."),
+    ], concentration)
 
-  def mean(self, name="mean"):
-    """Mean of the distribution."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._a, self._a_b_sum]):
-        return self._a / self._a_b_sum
+  def _maybe_assert_valid_sample(self, x):
+    """Checks the validity of a sample."""
+    if not self.validate_args:
+      return x
+    return control_flow_ops.with_dependencies([
+        check_ops.assert_positive(
+            x,
+            message="sample must be positive"),
+        check_ops.assert_less(
+            x, array_ops.ones([], self.dtype),
+            message="sample must be no larger than `1`."),
+    ], x)
 
-  def variance(self, name="variance"):
-    """Variance of the distribution."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._a, self._b, self._a_b_sum]):
-        return (self._a * self._b) / (
-            self._a_b_sum **2 * (self._a_b_sum + 1))
 
-  def std(self, name="std"):
-    """Standard deviation of the distribution."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name):
-        return math_ops.sqrt(self.variance())
+class BetaWithSoftplusConcentration(Beta):
+  """Beta with softplus transform of `concentration1` and `concentration0`."""
 
-  def mode(self, name="mode"):
-    """Mode of the distribution.
+  def __init__(self,
+               concentration1,
+               concentration0,
+               validate_args=False,
+               allow_nan_stats=True,
+               name="BetaWithSoftplusConcentration"):
+    parameters = locals()
+    with ops.name_scope(name, values=[concentration1,
+                                      concentration0]) as ns:
+      super(BetaWithSoftplusConcentration, self).__init__(
+          concentration1=nn.softplus(concentration1,
+                                     name="softplus_concentration1"),
+          concentration0=nn.softplus(concentration0,
+                                     name="softplus_concentration0"),
+          validate_args=validate_args,
+          allow_nan_stats=allow_nan_stats,
+          name=ns)
+    self._parameters = parameters
 
-    Note that the mode for the Beta distribution is only defined
-    when `a > 1`, `b > 1`. This returns the mode when `a > 1` and `b > 1`,
-    and NaN otherwise. If `self.allow_nan_stats` is `False`, an exception
-    will be raised rather than returning `NaN`.
 
-    Args:
-      name: The name for this op.
+@kullback_leibler.RegisterKL(Beta, Beta)
+def _kl_beta_beta(d1, d2, name=None):
+  """Calculate the batchwise KL divergence KL(d1 || d2) with d1 and d2 Beta.
 
-    Returns:
-      Mode of the Beta distribution.
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._a, self._b, self._a_b_sum]):
-        a = self._a
-        b = self._b
-        a_b_sum = self._a_b_sum
-        one = constant_op.constant(1, self.dtype)
-        mode = (a - 1)/ (a_b_sum - 2)
+  Args:
+    d1: instance of a Beta distribution object.
+    d2: instance of a Beta distribution object.
+    name: (optional) Name to use for created operations.
+      default is "kl_beta_beta".
 
-        if self.allow_nan_stats:
-          return math_ops.select(
-              math_ops.logical_and(
-                  math_ops.greater(a, 1), math_ops.greater(b, 1)),
-              mode,
-              (constant_op.constant(float("NaN"), dtype=self.dtype) *
-               array_ops.ones_like(a_b_sum, dtype=self.dtype)))
-        else:
-          return control_flow_ops.with_dependencies([
-              check_ops.assert_less(
-                  one, a,
-                  message="mode not defined for components of a <= 1"
-              ),
-              check_ops.assert_less(
-                  one, b,
-                  message="mode not defined for components of b <= 1"
-              )], mode)
-
-  def entropy(self, name="entropy"):
-    """Entropy of the distribution in nats."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._a, self._b, self._a_b_sum]):
-        a = self._a
-        b = self._b
-        a_b_sum = self._a_b_sum
-
-        entropy = math_ops.lgamma(a) - (a - 1) * math_ops.digamma(a)
-        entropy += math_ops.lgamma(b) - (b - 1) * math_ops.digamma(b)
-        entropy += -math_ops.lgamma(a_b_sum) + (
-            a_b_sum - 2) * math_ops.digamma(a_b_sum)
-        return entropy
-
-  def cdf(self, x, name="cdf"):
-    """Cumulative distribution function."""
-    # TODO(srvasude): Implement this once betainc op is checked in.
-    raise NotImplementedError("Beta cdf not implemented.")
-
-  def log_cdf(self, x, name="log_cdf"):
-    """Log CDF."""
-    raise NotImplementedError("Beta cdf not implemented.")
-
-  def log_prob(self, x, name="log_prob"):
-    """`Log(P[counts])`, computed for every batch member.
-
-    Args:
-      x:  Non-negative floating point tensor whose shape can
-        be broadcast with `self.a` and `self.b`.  For fixed leading
-        dimensions, the last dimension represents counts for the corresponding
-        Beta distribution in `self.a` and `self.b`. `x` is only legal if
-        0 < x < 1.
-      name:  Name to give this Op, defaults to "log_prob".
-
-    Returns:
-      Log probabilities for each record, shape `[N1,...,Nm]`.
-    """
-    a = self._a
-    b = self._b
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[a, x]):
-        x = self._check_x(x)
-
-        unnorm_pdf = (a - 1) * math_ops.log(x) + (
-            b - 1) * math_ops.log(1 - x)
-        normalization_factor = -(math_ops.lgamma(a) + math_ops.lgamma(b)
-                                 - math_ops.lgamma(a + b))
-        log_prob = unnorm_pdf + normalization_factor
-
-        return log_prob
-
-  def prob(self, x, name="prob"):
-    """`P[x]`, computed for every batch member.
-
-    Args:
-      x:  Non-negative floating point tensor whose shape can
-        be broadcast with `self.a` and `self.b`.  For fixed leading
-        dimensions, the last dimension represents x for the corresponding Beta
-        distribution in `self.a` and `self.b`. `x` is only legal if is
-        between 0 and 1.
-      name:  Name to give this Op, defaults to "pdf".
-
-    Returns:
-      Probabilities for each record, shape `[N1,...,Nm]`.
-    """
-    return super(Beta, self).prob(x, name=name)
-
-  def sample_n(self, n, seed=None, name="sample_n"):
-    """Sample `n` observations from the Beta Distributions.
-
-    Args:
-      n: `Scalar`, type int32, the number of observations to sample.
-      seed: Python integer, the random seed.
-      name: The name to give this op.
-
-    Returns:
-      samples: `[n, ...]`, a `Tensor` of `n` samples for each
-        of the distributions determined by broadcasting the hyperparameters.
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self.a, self.b, n]):
-        a = array_ops.ones_like(self._a_b_sum, dtype=self.dtype) * self.a
-        b = array_ops.ones_like(self._a_b_sum, dtype=self.dtype) * self.b
-        n = ops.convert_to_tensor(n)
-
-        gamma1_sample = random_ops.random_gamma(
-            [n,], a, dtype=self.dtype, seed=seed)
-        gamma2_sample = random_ops.random_gamma(
-            [n,], b, dtype=self.dtype, seed=seed)
-
-        beta_sample = gamma1_sample / (gamma1_sample + gamma2_sample)
-
-        n_val = tensor_util.constant_value(n)
-        final_shape = tensor_shape.vector(n_val).concatenate(
-            self._a_b_sum.get_shape())
-
-        beta_sample.set_shape(final_shape)
-        return beta_sample
-
-  @property
-  def is_continuous(self):
-    return True
-
-  @property
-  def is_reparameterized(self):
-    return False
-
-  def _check_x(self, x):
-    """Check x for proper shape, values, then return tensor version."""
-    x = ops.convert_to_tensor(x, name="x_before_deps")
-    dependencies = [
-        check_ops.assert_positive(x),
-        check_ops.assert_less(x, constant_op.constant(
-            1, self.dtype))] if self.validate_args else []
-    return control_flow_ops.with_dependencies(dependencies, x)
+  Returns:
+    Batchwise KL(d1 || d2)
+  """
+  def delta(fn, is_property=True):
+    fn1 = getattr(d1, fn)
+    fn2 = getattr(d2, fn)
+    return (fn2 - fn1) if is_property else (fn2() - fn1())
+  with ops.name_scope(name, "kl_beta_beta", values=[
+      d1.concentration1,
+      d1.concentration0,
+      d1.total_concentration,
+      d2.concentration1,
+      d2.concentration0,
+      d2.total_concentration,
+  ]):
+    return (delta("_log_normalization", is_property=False)
+            - math_ops.digamma(d1.concentration1) * delta("concentration1")
+            - math_ops.digamma(d1.concentration0) * delta("concentration0")
+            + (math_ops.digamma(d1.total_concentration)
+               * delta("total_concentration")))

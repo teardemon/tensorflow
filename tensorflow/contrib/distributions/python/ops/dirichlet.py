@@ -13,16 +13,16 @@
 # limitations under the License.
 # ==============================================================================
 """The Dirichlet distribution class."""
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import numpy as np
+
 from tensorflow.contrib.distributions.python.ops import distribution
 from tensorflow.contrib.distributions.python.ops import distribution_util
-from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import ops
-from tensorflow.python.framework import tensor_shape
-from tensorflow.python.framework import tensor_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
 from tensorflow.python.ops import control_flow_ops
@@ -31,364 +31,267 @@ from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import special_math_ops
 
 
+__all__ = [
+    "Dirichlet",
+]
+
+
+_dirichlet_sample_note = """Note: `value` must be a non-negative tensor with
+dtype `self.dtype` and be in the `(self.event_shape() - 1)`-simplex, i.e.,
+`tf.reduce_sum(value, -1) = 1`. It must have a shape compatible with
+`self.batch_shape() + self.event_shape()`."""
+
+
 class Dirichlet(distribution.Distribution):
   """Dirichlet distribution.
 
-  This distribution is parameterized by a vector `alpha` of concentration
-  parameters for `k` classes.
+  The Dirichlet distribution is defined over the
+  [`(k-1)`-simplex](https://en.wikipedia.org/wiki/Simplex) using a positive,
+  length-`k` vector `concentration` (`k > 1`). The Dirichlet is identically the
+  Beta distribution when `k = 2`.
 
-  #### Mathematical details
+  #### Mathematical Details
 
-  The Dirichlet is a distribution over the standard n-simplex, where the
-  standard n-simplex is defined by:
-  ```{ (x_1, ..., x_n) in R^(n+1) | sum_j x_j = 1 and x_j >= 0 for all j }```.
-  The distribution has hyperparameters `alpha = (alpha_1,...,alpha_k)`,
-  and probability mass function (prob):
+  The Dirichlet is a distribution over the open `(k-1)`-simplex, i.e.,
 
-  ```prob(x) = 1 / Beta(alpha) * prod_j x_j^(alpha_j - 1)```
+  ```none
+  S^{k-1} = { (x_0, ..., x_{k-1}) in R^k : sum_j x_j = 1 and all_j x_j > 0 }.
+  ```
 
-  where `Beta(x) = prod_j Gamma(x_j) / Gamma(sum_j x_j)` is the multivariate
-  beta function.
+  The probability density function (pdf) is,
 
+  ```none
+  pdf(x; alpha) = prod_j x_j**(alpha_j - 1) / Z
+  Z = prod_j Gamma(alpha_j) / Gamma(sum_j alpha_j)
+  ```
 
-  This class provides methods to create indexed batches of Dirichlet
-  distributions.  If the provided `alpha` is rank 2 or higher, for
-  every fixed set of leading dimensions, the last dimension represents one
-  single Dirichlet distribution.  When calling distribution
-  functions (e.g. `dist.prob(x)`), `alpha` and `x` are broadcast to the
-  same shape (if possible).  In all cases, the last dimension of alpha/x
-  represents single Dirichlet distributions.
+  where:
+
+  * `x in S^{k-1}`, i.e., the `(k-1)`-simplex,
+  * `concentration = alpha = [alpha_0, ..., alpha_{k-1}]`, `alpha_j > 0`,
+  * `Z` is the normalization constant aka the [multivariate beta function](
+    https://en.wikipedia.org/wiki/Beta_function#Multivariate_beta_function),
+    and,
+  * `Gamma` is the [gamma function](
+    https://en.wikipedia.org/wiki/Gamma_function).
+
+  The `concentration` represents mean total counts of class occurrence, i.e.,
+
+  ```none
+  concentration = alpha = mean * total_concentration
+  ```
+
+  where `mean` in `S^{k-1}` and `total_concentration` is a positive real number
+  representing a mean total count.
+
+  Distribution parameters are automatically broadcast in all functions; see
+  examples for details.
 
   #### Examples
 
   ```python
-  alpha = [1, 2, 3]
+  # Create a single trivariate Dirichlet, with the 3rd class being three times
+  # more frequent than the first. I.e., batch_shape=[], event_shape=[3].
+  alpha = [1., 2, 3]
   dist = Dirichlet(alpha)
-  ```
 
-  Creates a 3-class distribution, with the 3rd class is most likely to be drawn.
-  The distribution functions can be evaluated on x.
+  dist.sample([4, 5])  # shape: [4, 5, 3]
 
-  ```python
-  # x same shape as alpha.
-  x = [.2, .3, .5]
-  dist.prob(x)  # Shape []
+  # x has one sample, one batch, three classes:
+  x = [.2, .3, .5]   # shape: [3]
+  dist.prob(x)       # shape: []
 
-  # alpha will be broadcast to [[1, 2, 3], [1, 2, 3]] to match x.
-  x = [[.1, .4, .5], [.2, .3, .5]]
-  dist.prob(x)  # Shape [2]
+  # x has two samples from one batch:
+  x = [[.1, .4, .5],
+       [.2, .3, .5]]
+  dist.prob(x)         # shape: [2]
 
   # alpha will be broadcast to shape [5, 7, 3] to match x.
-  x = [[...]]  # Shape [5, 7, 3]
-  dist.prob(x)  # Shape [5, 7]
+  x = [[...]]   # shape: [5, 7, 3]
+  dist.prob(x)  # shape: [5, 7]
   ```
 
-  Creates a 2-batch of 3-class distributions.
-
   ```python
-  alpha = [[1, 2, 3], [4, 5, 6]]  # Shape [2, 3]
+  # Create batch_shape=[2], event_shape=[3]:
+  alpha = [[1., 2, 3],
+           [4, 5, 6]]   # shape: [2, 3]
   dist = Dirichlet(alpha)
 
-  # x will be broadcast to [[2, 1, 0], [2, 1, 0]] to match alpha.
+  dist.sample([4, 5])  # shape: [4, 5, 2, 3]
+
   x = [.2, .3, .5]
-  dist.prob(x)  # Shape [2]
+  # x will be broadcast as [[.2, .3, .5],
+  #                         [.2, .3, .5]],
+  # thus matching batch_shape [2, 3].
+  dist.prob(x)         # shape: [2]
   ```
 
   """
 
   def __init__(self,
-               alpha,
-               validate_args=True,
-               allow_nan_stats=False,
+               concentration,
+               validate_args=False,
+               allow_nan_stats=True,
                name="Dirichlet"):
     """Initialize a batch of Dirichlet distributions.
 
     Args:
-      alpha:  Positive floating point tensor with shape broadcastable to
-        `[N1,..., Nm, k]` `m >= 0`.  Defines this as a batch of `N1 x ... x Nm`
-         different `k` class Dirichlet distributions.
-      validate_args: Whether to assert valid values for parameters `alpha` and
-        `x` in `prob` and `log_prob`.  If `False`, correct behavior is not
-        guaranteed.
-      allow_nan_stats:  Boolean, default `False`.  If `False`, raise an
-        exception if a statistic (e.g. mean/mode/etc...) is undefined for any
-        batch member.  If `True`, batch members with valid parameters leading to
-        undefined statistics will return NaN for this statistic.
-      name: The name to prefix Ops created by this distribution class.
-
-    Examples:
-
-    ```python
-    # Define 1-batch of 2-class Dirichlet distributions,
-    # also known as a Beta distribution.
-    dist = Dirichlet([1.1, 2.0])
-
-    # Define a 2-batch of 3-class distributions.
-    dist = Dirichlet([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    ```
-
+      concentration: Positive floating-point `Tensor` indicating mean number
+        of class occurrences; aka "alpha". Implies `self.dtype`, and
+        `self.batch_shape`, `self.event_shape`, i.e., if
+        `concentration.shape = [N1, N2, ..., Nm, k]` then
+        `batch_shape = [N1, N2, ..., Nm]` and
+        `event_shape = [k]`.
+      validate_args: Python `bool`, default `False`. When `True` distribution
+        parameters are checked for validity despite possibly degrading runtime
+        performance. When `False` invalid inputs may silently render incorrect
+        outputs.
+      allow_nan_stats: Python `bool`, default `True`. When `True`, statistics
+        (e.g., mean, mode, variance) use the value "`NaN`" to indicate the
+        result is undefined. When `False`, an exception is raised if one or
+        more of the statistic's batch members are undefined.
+      name: Python `str` name prefixed to Ops created by this class.
     """
-    with ops.name_scope(name, values=[alpha]):
-      alpha = ops.convert_to_tensor(alpha, name="alpha_before_deps")
-      with ops.control_dependencies([
-          check_ops.assert_positive(alpha), check_ops.assert_rank_at_least(
-              alpha, 1)
-      ] if validate_args else []):
-        alpha = array_ops.identity(alpha, name="alpha")
-
-      self._alpha = alpha
-      self._name = name
-
-      # Used for mean/mode/variance/entropy computations
-      self._alpha_0 = math_ops.reduce_sum(alpha,
-                                          reduction_indices=[-1],
-                                          keep_dims=False)
-
-      self._get_batch_shape = self._alpha_0.get_shape()
-      self._get_event_shape = self._alpha.get_shape().with_rank_at_least(1)[-1:]
-      self._validate_args = validate_args
-      self._allow_nan_stats = allow_nan_stats
+    parameters = locals()
+    with ops.name_scope(name, values=[concentration]):
+      self._concentration = self._maybe_assert_valid_concentration(
+          ops.convert_to_tensor(concentration, name="concentration"),
+          validate_args)
+      self._total_concentration = math_ops.reduce_sum(self._concentration, -1)
+    super(Dirichlet, self).__init__(
+        dtype=self._concentration.dtype,
+        validate_args=validate_args,
+        allow_nan_stats=allow_nan_stats,
+        reparameterization_type=distribution.NOT_REPARAMETERIZED,
+        parameters=parameters,
+        graph_parents=[self._concentration,
+                       self._total_concentration],
+        name=name)
 
   @property
-  def alpha(self):
-    """Shape parameter."""
-    return self._alpha
+  def concentration(self):
+    """Concentration parameter; expected counts for that coordinate."""
+    return self._concentration
 
   @property
-  def name(self):
-    """Name to prepend to all ops."""
-    return self._name
+  def total_concentration(self):
+    """Sum of last dim of concentration parameter."""
+    return self._total_concentration
 
-  @property
-  def dtype(self):
-    """dtype of samples from this distribution."""
-    return self._alpha.dtype
+  def _batch_shape_tensor(self):
+    return array_ops.shape(self.total_concentration)
 
-  @property
-  def allow_nan_stats(self):
-    """Boolean describing behavior when a stat is undefined for batch member."""
-    return self._allow_nan_stats
+  def _batch_shape(self):
+    return self.total_concentration.get_shape()
 
-  @property
-  def validate_args(self):
-    """Boolean describing behavior on invalid input."""
-    return self._validate_args
+  def _event_shape_tensor(self):
+    return array_ops.shape(self.concentration)[-1:]
 
-  def batch_shape(self, name="batch_shape"):
-    """Batch dimensions of this instance as a 1-D int32 `Tensor`.
+  def _event_shape(self):
+    return self.concentration.get_shape().with_rank_at_least(1)[-1:]
 
-    The product of the dimensions of the `batch_shape` is the number of
-    independent distributions of this kind the instance represents.
+  def _sample_n(self, n, seed=None):
+    gamma_sample = random_ops.random_gamma(
+        shape=[n],
+        alpha=self.concentration,
+        dtype=self.dtype,
+        seed=seed)
+    return gamma_sample / math_ops.reduce_sum(gamma_sample, -1, keep_dims=True)
 
-    Args:
-      name: name to give to the op
+  @distribution_util.AppendDocstring(_dirichlet_sample_note)
+  def _log_prob(self, x):
+    return self._log_unnormalized_prob(x) - self._log_normalization()
 
-    Returns:
-      `Tensor` `batch_shape`
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._alpha]):
-        return array_ops.shape(self._alpha_0)
+  @distribution_util.AppendDocstring(_dirichlet_sample_note)
+  def _prob(self, x):
+    return math_ops.exp(self._log_prob(x))
 
-  def get_batch_shape(self):
-    """`TensorShape` available at graph construction time.
+  def _log_unnormalized_prob(self, x):
+    x = self._maybe_assert_valid_sample(x)
+    return math_ops.reduce_sum((self.concentration - 1.) * math_ops.log(x), -1)
 
-    Same meaning as `batch_shape`. May be only partially defined.
+  def _log_normalization(self):
+    return special_math_ops.lbeta(self.concentration)
 
-    Returns:
-      batch shape
-    """
-    return self._get_batch_shape
+  def _entropy(self):
+    k = math_ops.cast(self.event_shape_tensor()[0], self.dtype)
+    return (
+        self._log_normalization()
+        + ((self.total_concentration - k)
+           * math_ops.digamma(self.total_concentration))
+        - math_ops.reduce_sum(
+            (self.concentration - 1.) * math_ops.digamma(self.concentration),
+            axis=-1))
 
-  def event_shape(self, name="event_shape"):
-    """Shape of a sample from a single distribution as a 1-D int32 `Tensor`.
+  def _mean(self):
+    return self.concentration / self.total_concentration[..., array_ops.newaxis]
 
-    Args:
-      name: name to give to the op
+  def _covariance(self):
+    x = self._variance_scale_term() * self._mean()
+    return array_ops.matrix_set_diag(
+        -math_ops.matmul(x[..., array_ops.newaxis],
+                         x[..., array_ops.newaxis, :]),  # outer prod
+        self._variance())
 
-    Returns:
-      `Tensor` `event_shape`
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._alpha]):
-        return array_ops.gather(array_ops.shape(self._alpha),
-                                [array_ops.rank(self._alpha) - 1])
+  def _variance(self):
+    scale = self._variance_scale_term()
+    x = scale * self._mean()
+    return x * (scale - x)
 
-  def get_event_shape(self):
-    """`TensorShape` available at graph construction time.
+  def _variance_scale_term(self):
+    """Helper to `_covariance` and `_variance` which computes a shared scale."""
+    return math_ops.rsqrt(1. + self.total_concentration[..., array_ops.newaxis])
 
-    Same meaning as `event_shape`. May be only partially defined.
+  @distribution_util.AppendDocstring(
+      """Note: The mode is undefined when any `concentration <= 1`. If
+      `self.allow_nan_stats` is `True`, `NaN` is used for undefined modes. If
+      `self.allow_nan_stats` is `False` an exception is raised when one or more
+      modes are undefined.""")
+  def _mode(self):
+    k = math_ops.cast(self.event_shape_tensor()[0], self.dtype)
+    mode = (self.concentration - 1.) / (
+        self.total_concentration[..., array_ops.newaxis] - k)
+    if self.allow_nan_stats:
+      nan = array_ops.fill(
+          array_ops.shape(mode),
+          np.array(np.nan, dtype=self.dtype.as_numpy_dtype()),
+          name="nan")
+      return array_ops.where(
+          math_ops.reduce_all(self.concentration > 1., axis=-1),
+          mode, nan)
+    return control_flow_ops.with_dependencies([
+        check_ops.assert_less(
+            array_ops.ones([], self.dtype),
+            self.concentration,
+            message="Mode undefined when any concentration <= 1"),
+    ], mode)
 
-    Returns:
-      event shape
-    """
-    return self._get_event_shape
+  def _maybe_assert_valid_concentration(self, concentration, validate_args):
+    """Checks the validity of the concentration parameter."""
+    if not validate_args:
+      return concentration
+    return control_flow_ops.with_dependencies([
+        check_ops.assert_positive(
+            concentration,
+            message="Concentration parameter must be positive."),
+        check_ops.assert_rank_at_least(
+            concentration, 1,
+            message="Concentration parameter must have >=1 dimensions."),
+        check_ops.assert_less(
+            1, array_ops.shape(concentration)[-1],
+            message="Concentration parameter must have event_size >= 2."),
+    ], concentration)
 
-  def mean(self, name="mean"):
-    """Mean of the distribution."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._alpha, self._alpha_0]):
-        return self._alpha / array_ops.expand_dims(self._alpha_0, -1)
-
-  def variance(self, name="variance"):
-    """Variance of the distribution."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._alpha, self._alpha_0]):
-        alpha = array_ops.expand_dims(self._alpha, -1)
-        alpha_0 = array_ops.expand_dims(self._alpha_0, -1)
-
-        expanded_alpha_0 = array_ops.expand_dims(alpha_0, -1)
-
-        variance = -math_ops.batch_matmul(alpha, alpha, adj_y=True) / (
-            expanded_alpha_0 ** 2 * (expanded_alpha_0 + 1))
-        diagonal = self._alpha / (alpha_0 * (alpha_0 + 1))
-        variance += array_ops.batch_matrix_diag(diagonal)
-        return variance
-
-  def std(self, name="std"):
-    """Standard deviation of the distribution."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name):
-        return math_ops.sqrt(self.variance())
-
-  def mode(self, name="mode"):
-    """Mode of the distribution.
-
-    Note that the mode for the Beta distribution is only defined
-    when `alpha > 1`. This returns the mode when `alpha > 1`,
-    and NaN otherwise. If `self.allow_nan_stats` is `False`, an exception
-    will be raised rather than returning `NaN`.
-
-    Args:
-      name: The name for this op.
-
-    Returns:
-      Mode of the Dirichlet distribution.
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._alpha, self._alpha_0]):
-        one = constant_op.constant(1, self.dtype)
-        mode = (self._alpha - 1)/ (
-            array_ops.expand_dims(self._alpha_0, -1) - math_ops.cast(
-                self.event_shape()[0], self.dtype))
-
-        if self.allow_nan_stats:
-          return math_ops.select(
-              math_ops.greater(self._alpha, 1),
-              mode,
-              (constant_op.constant(float("NaN"), dtype=self.dtype) *
-               array_ops.ones_like(self._alpha, dtype=self.dtype)))
-        else:
-          return control_flow_ops.with_dependencies([
-              check_ops.assert_less(
-                  one, self._alpha,
-                  message="mode not defined for components of alpha <= 1")
-          ], mode)
-
-  def entropy(self, name="entropy"):
-    """Entropy of the distribution in nats."""
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self._alpha, self._alpha_0]):
-        alpha = self._alpha
-        alpha_0 = self._alpha_0
-
-        entropy = special_math_ops.lbeta(alpha)
-        entropy += (alpha_0 - math_ops.cast(
-            self.event_shape()[0], self.dtype)) * math_ops.digamma(
-                alpha_0)
-        entropy += -math_ops.reduce_sum(
-            (alpha - 1) * math_ops.digamma(alpha),
-            reduction_indices=[-1],
-            keep_dims=False)
-        return entropy
-
-  def cdf(self, x, name="cdf"):
-    """Cumulative distribution function."""
-    raise NotImplementedError("Dirichlet does not have a well-defined cdf.")
-
-  def log_cdf(self, x, name="log_cdf"):
-    """Log CDF."""
-    raise NotImplementedError("Dirichlet does not have a well-defined cdf.")
-
-  def log_prob(self, x, name="log_prob"):
-    """`Log(P[counts])`, computed for every batch member.
-
-    Args:
-      x:  Non-negative tensor with dtype `dtype` and whose shape can
-        be broadcast with `self.alpha`.  For fixed leading dimensions, the last
-        dimension represents counts for the corresponding Dirichlet distribution
-        in `self.alpha`. `x` is only legal if it sums up to one.
-      name:  Name to give this Op, defaults to "log_prob".
-
-    Returns:
-      Log probabilities for each record, shape `[N1,...,Nm]`.
-    """
-    alpha = self._alpha
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[alpha, x]):
-        x = self._check_x(x)
-
-        unnorm_prob = (alpha - 1) * math_ops.log(x)
-        log_prob = math_ops.reduce_sum(
-            unnorm_prob, reduction_indices=[-1],
-            keep_dims=False) - special_math_ops.lbeta(alpha)
-
-        return log_prob
-
-  def prob(self, x, name="prob"):
-    """`P[x]`, computed for every batch member.
-
-    Args:
-      x:  Non-negative tensor with dtype `dtype` and whose shape can
-        be broadcast with `self.alpha`.  For fixed leading dimensions, the last
-        dimension represents x for the corresponding Dirichlet distribution in
-        `self.alpha` and `self.beta`. `x` is only legal if it sums up to one.
-      name:  Name to give this Op, defaults to "prob".
-
-    Returns:
-      Probabilities for each record, shape `[N1,...,Nm]`.
-    """
-    return super(Dirichlet, self).prob(x, name=name)
-
-  def sample_n(self, n, seed=None, name="sample_n"):
-    """Sample `n` observations from the distributions.
-
-    Args:
-      n: `Scalar`, type int32, the number of observations to sample.
-      seed: Python integer, the random seed.
-      name: The name to give this op.
-
-    Returns:
-      samples: `[n, ...]`, a `Tensor` of `n` samples for each
-        of the distributions determined by broadcasting the hyperparameters.
-    """
-    with ops.name_scope(self.name):
-      with ops.name_scope(name, values=[self.alpha, n]):
-        gamma_sample = random_ops.random_gamma(
-            [n,], self.alpha, dtype=self.dtype, seed=seed)
-        n_val = tensor_util.constant_value(n)
-        final_shape = tensor_shape.vector(n_val).concatenate(
-            self.alpha.get_shape())
-
-        gamma_sample.set_shape(final_shape)
-        return gamma_sample / math_ops.reduce_sum(
-            gamma_sample, reduction_indices=[-1], keep_dims=True)
-
-  @property
-  def is_continuous(self):
-    return True
-
-  @property
-  def is_reparameterized(self):
-    return False
-
-  def _check_x(self, x):
-    """Check x for proper shape, values, then return tensor version."""
-    x = ops.convert_to_tensor(x, name="x_before_deps")
-    candidate_one = math_ops.reduce_sum(x, reduction_indices=[-1])
-    one = constant_op.constant(1., self.dtype)
-    dependencies = [check_ops.assert_positive(x), check_ops.assert_less(
-        x, one, message="x has components greater than or equal to 1"),
-                    distribution_util.assert_close(one, candidate_one)
-                   ] if self.validate_args else []
-    return control_flow_ops.with_dependencies(dependencies, x)
+  def _maybe_assert_valid_sample(self, x):
+    """Checks the validity of a sample."""
+    if not self.validate_args:
+      return x
+    return control_flow_ops.with_dependencies([
+        check_ops.assert_positive(
+            x,
+            message="samples must be positive"),
+        distribution_util.assert_close(
+            array_ops.ones([], dtype=self.dtype),
+            math_ops.reduce_sum(x, -1),
+            message="sample last-dimension must sum to `1`"),
+    ], x)

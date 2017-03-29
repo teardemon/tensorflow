@@ -38,6 +38,7 @@ namespace tensorflow {
 class TensorBuffer;  // Forward declaration.
 class TensorCApi;
 
+/// @ingroup core
 /// Represents an n-dimensional array of values.
 class Tensor {
  public:
@@ -99,11 +100,12 @@ class Tensor {
   /// for details.
   explicit Tensor(DataType type);
 
-  Tensor(const Tensor& other);  /// Copy constructor.
+  /// Copy constructor.
+  Tensor(const Tensor& other);
 
-  // Move constructor.  After this call, <other> is safely destructible and can
-  // be assigned to, but other calls on it (e.g. shape manipulation) are not
-  // valid.
+  /// \brief Move constructor. After this call, <other> is safely destructible and can
+  /// be assigned to, but other calls on it (e.g. shape manipulation) are not
+  /// valid.
   Tensor(Tensor&& other);
 
   ~Tensor();
@@ -133,10 +135,6 @@ class Tensor {
   // True iff the two tensors use the same underlying refcounted storage
   bool SharesBufferWith(const Tensor& b) const;
 
-  // The BufferHash of two tensors are equal when they share the same
-  // underlying refcounted storage
-  size_t BufferHash() const;
-
   /// \brief If necessary, has this Tensor been initialized?
   ///
   /// Zero-element Tensors are always considered initialized, even if they
@@ -146,13 +144,16 @@ class Tensor {
   /// Returns the estimated memory usage of this tensor.
   size_t TotalBytes() const;
 
+  // Returns the size of sallocated memory for this tensor.
+  size_t AllocatedBytes() const;
+
   /// Returns true iff this tensor is aligned.
   bool IsAligned() const {
-#if EIGEN_ALIGN == 1
+#if EIGEN_MAX_ALIGN_BYTES == 0
+    return true;
+#else
     void* ptr = base<void>();
     return reinterpret_cast<intptr_t>(ptr) % EIGEN_MAX_ALIGN_BYTES == 0;
-#else
-    return true;
 #endif
   }
 
@@ -416,6 +417,9 @@ class Tensor {
                               const TensorShape&);
 
  private:
+  // Returns true if the refcount on buf_ and any possible underlying root
+  // buffer is one.
+  bool RefCountIsOne() const;
   void CheckType(DataType expected_dtype) const;
   void CheckTypeAndIsAligned(DataType expected_dtype) const;
   void CheckIsAlignedAndSingleElement() const;
@@ -439,6 +443,11 @@ class Tensor {
   friend class VariableOp;            // For access to set_shape
   friend class AutoReloadVariableOp;  // For access to set_shape
   friend class TensorTestHelper;      // For access to set_shape
+  template <typename Device, typename T>
+  friend class CreateVariableOp;
+  friend class OpKernelContext;  // For access to RefCountIsOne().
+  friend class NumpyTensorBuffer;  // For access to the private constructor
+                                   // taking the buffer.
 
   // Creates a tensor with the input datatype, shape and buf.
   //
@@ -469,6 +478,8 @@ class Tensor {
 };
 
 // Implementation details
+
+// START_SKIP_DOXYGEN
 
 // Interface to access the raw ref-counted data buffer.
 class TensorBuffer : public core::RefCounted {
@@ -662,6 +673,8 @@ inline Tensor& Tensor::operator=(Tensor&& other) {
   }
   return *this;
 }
+
+// END_SKIP_DOXYGEN
 
 }  // namespace tensorflow
 

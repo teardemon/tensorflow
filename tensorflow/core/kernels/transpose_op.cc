@@ -71,14 +71,25 @@ class InvertPermutationOp : public OpKernel {
   }
 };
 
-REGISTER_KERNEL_BUILDER(Name("InvertPermutation").Device(DEVICE_CPU),
-                        InvertPermutationOp);
+REGISTER_KERNEL_BUILDER(
+    Name("InvertPermutation").Device(DEVICE_CPU).TypeConstraint<int32>("T"),
+    InvertPermutationOp);
 
 REGISTER_KERNEL_BUILDER(Name("InvertPermutation")
                             .Device(DEVICE_GPU)
+                            .TypeConstraint<int32>("T")
                             .HostMemory("x")
                             .HostMemory("y"),
                         InvertPermutationOp);
+
+#ifdef TENSORFLOW_USE_SYCL
+REGISTER_KERNEL_BUILDER(Name("InvertPermutation")
+                            .Device(DEVICE_SYCL)
+                            .TypeConstraint<int32>("T")
+                            .HostMemory("x")
+                            .HostMemory("y"),
+                        InvertPermutationOp);
+#endif // TENSORFLOW_USE_SYCL
 
 // output = TransposeOp(T<any> input, T<int32> perm) takes a tensor
 // of type T and rank N, and a permutation of 0, 1, ..., N-1. It
@@ -169,15 +180,31 @@ Status TransposeCpuOp::DoTranspose(OpKernelContext* ctx, const Tensor& in,
                                    out);
 }
 
-#define REGISTER(T)                                   \
-  REGISTER_KERNEL_BUILDER(Name("Transpose")           \
-                              .Device(DEVICE_CPU)     \
-                              .TypeConstraint<T>("T") \
-                              .HostMemory("perm"),    \
+#ifdef INTEL_MKL
+#define REGISTER(T)                                           \
+  REGISTER_KERNEL_BUILDER(Name("Transpose")                   \
+                              .Device(DEVICE_CPU)             \
+                              .TypeConstraint<T>("T")         \
+                              .TypeConstraint<int32>("Tperm") \
+                              .HostMemory("perm"),            \
+                          MklTransposeCpuOp);
+TF_CALL_ALL_TYPES(REGISTER);
+REGISTER(bfloat16);
+#undef REGISTER
+
+#else  // INTEL_MKL
+
+#define REGISTER(T)                                           \
+  REGISTER_KERNEL_BUILDER(Name("Transpose")                   \
+                              .Device(DEVICE_CPU)             \
+                              .TypeConstraint<T>("T")         \
+                              .TypeConstraint<int32>("Tperm") \
+                              .HostMemory("perm"),            \
                           TransposeCpuOp);
 TF_CALL_ALL_TYPES(REGISTER)
 REGISTER(bfloat16);
 #undef REGISTER
+#endif  // INTEL_MKL
 
 #if GOOGLE_CUDA
 Status TransposeGpuOp::DoTranspose(OpKernelContext* ctx, const Tensor& in,
@@ -187,13 +214,34 @@ Status TransposeGpuOp::DoTranspose(OpKernelContext* ctx, const Tensor& in,
                                    out);
 }
 
-#define REGISTER(T)                                   \
-  REGISTER_KERNEL_BUILDER(Name("Transpose")           \
-                              .Device(DEVICE_GPU)     \
-                              .TypeConstraint<T>("T") \
-                              .HostMemory("perm"),    \
+#define REGISTER(T)                                           \
+  REGISTER_KERNEL_BUILDER(Name("Transpose")                   \
+                              .Device(DEVICE_GPU)             \
+                              .TypeConstraint<T>("T")         \
+                              .TypeConstraint<int32>("Tperm") \
+                              .HostMemory("perm"),            \
                           TransposeGpuOp);
 TF_CALL_POD_TYPES(REGISTER);
+#undef REGISTER
+#endif
+
+#ifdef TENSORFLOW_USE_SYCL
+Status TransposeSyclOp::DoTranspose(OpKernelContext* ctx, const Tensor& in,
+                                   gtl::ArraySlice<int32> perm, Tensor* out) {
+  typedef Eigen::SyclDevice SYCLDevice;
+  return ::tensorflow::DoTranspose(ctx->eigen_device<SYCLDevice>(), in, perm,
+                                   out);
+}
+#define REGISTER(T)                                           \
+  REGISTER_KERNEL_BUILDER(Name("Transpose")                   \
+                              .Device(DEVICE_SYCL)            \
+                              .TypeConstraint<T>("T")         \
+                              .TypeConstraint<int32>("Tperm") \
+                              .HostMemory("perm"),            \
+                          TransposeSyclOp);
+REGISTER(float);
+REGISTER(bool);
+REGISTER(int32);
 #undef REGISTER
 #endif
 
